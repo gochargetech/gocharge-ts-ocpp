@@ -18,6 +18,7 @@ import { OCPPVersion } from '../types';
 import SOAPConnection from '../soap/connection';
 import Debug from "debug";
 const debug = Debug("ts-ocpp:cs");
+import {createServer as createHttpsServer, Server as HttpsServer} from 'https';
 
 const handleProtocols = (protocols: string[]): string =>
   protocols.find((protocol) => SUPPORTED_PROTOCOLS.includes(protocol)) ?? '';
@@ -71,6 +72,9 @@ export type CentralSystemOptions = {
 
   /** can be used to authorize websockets before the socket formation */
   websocketAuthorizer?: (metadata: RequestMetadata) => Promise<boolean> | boolean,
+
+  sslCertificatePath?: string,
+  sslKeyPath?: string,
 }
 
 type RequiredPick<T, K extends keyof T> = Omit<T, K> & Required<Pick<T, K>>
@@ -110,7 +114,7 @@ export default class CentralSystem {
   private listeners: ConnectionListener[] = [];
   private websocketsServer: WebSocket.Server;
   private soapServer: soap.Server;
-  private httpServer: Server;
+  private server: Server | HttpsServer;
   private options: RequiredPick<CentralSystemOptions, 'websocketPingInterval' | 'rejectInvalidRequests' | 'websocketAuthorizer'>;
 
   constructor(
@@ -128,17 +132,24 @@ export default class CentralSystem {
     };
     debug('creating central system on port %d - options: %o', port, this.options);
 
-    this.httpServer = createServer();
+    if (options.sslCertificatePath && options.sslKeyPath) {
+      this.server = createHttpsServer({
+        cert: fs.readFileSync(options.sslCertificatePath),
+        key: fs.readFileSync(options.sslKeyPath)
+      });
+    } else {
+      this.server = createServer();
+    }
     const httpDebug = debug.extend('http');
-    this.httpServer.on('connection', socket => {
+    this.server.on('connection', socket => {
       httpDebug('new http connection');
-      socket.on('data', data => {
+      socket.on('data', (data: any) => {
         httpDebug('http connection received data:\n%s', data.toString('ascii'));
         if (options.onRawSocketData)
           options.onRawSocketData?.(data);
       });
     })
-    this.httpServer.listen(port, host);
+    this.server.listen(port, host);
 
     this.soapServer = this.setupSoapServer();
     this.websocketsServer = this.setupWebsocketsServer();
@@ -149,7 +160,7 @@ export default class CentralSystem {
   }
 
   public close(): Promise<void> {
-    const httpClosing = new Promise(resolve => this.httpServer.close(resolve));
+    const httpClosing = new Promise(resolve => this.server.close(resolve));
     const wsClosing = new Promise(resolve => this.websocketsServer.close(resolve));
     return Promise.all([httpClosing, wsClosing]).then(() => { });
   }
@@ -203,7 +214,7 @@ export default class CentralSystem {
       }
     };
     const xml = fs.readFileSync(path.resolve(__dirname, '../messages/soap/ocpp_centralsystemservice_1.5_final.wsdl'), 'utf8');
-    const server = soap.listen(this.httpServer, {
+    const server = soap.listen(this.server, {
       services,
       path: '/',
       xml,
@@ -240,7 +251,7 @@ export default class CentralSystem {
     server.on('connection', (socket: WebSocket, _request: IncomingMessage, metadata: RequestMetadata) => this.handleConnection(socket, metadata));
     
     /** validate all pre-requisites before upgrading the websocket connection */
-    this.httpServer.on('upgrade', async (httpRequest, socket, head) => {
+    this.server.on('upgrade', async (httpRequest, socket, head) => {
       debug('websocket upgrade: %s', httpRequest.url);
       if (!httpRequest.headers['sec-websocket-protocol']) {
         debug('websocket upgrade: no websocket protocol header, rejecting connection');
